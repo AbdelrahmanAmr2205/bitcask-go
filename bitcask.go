@@ -43,10 +43,12 @@ type keyDirEntry struct {
 }
 
 type Config struct {
-	Directory         string        // Path to the data directory on disk
-	MaxActiveFileSize int64         // Max size in bytes before rotating the active file
-	CompactInterval   time.Duration // Time window between background compaction merges
-	SyncPeriod        time.Duration // Optional background interval to force fsync (0 means disabled)
+	Directory                string        // Path to the data directory on disk
+	MaxActiveFileSize        int64         // Max size in bytes before rotating the active file
+	CompactInterval          time.Duration // Time window between background compaction merges
+	SyncPeriod               time.Duration // Optional background interval to force fsync (0 means disabled)
+	ExpectedWriteRate        int64         // expected write requests size per second (eg. 1024 bytes/sec)
+	ExpectedFilesPerInterval int           // expected number of generated files per compaction interval
 }
 
 func (db *DB) startWriteLoop(ctx context.Context) {
@@ -91,8 +93,8 @@ func (db *DB) createNewActiveFile(fileID int) error {
 	for range 5 {
 		newFile, err := datafile.OpenDataFile(db.config.Directory, fileID)
 		if err == nil {
-			db.activeFile = newFile
 			db.muFiles.Lock()
+			db.activeFile = newFile
 			db.files[fileID] = newFile
 			db.muFiles.Unlock()
 			return nil

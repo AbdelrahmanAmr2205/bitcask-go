@@ -77,6 +77,8 @@ func (df *DataFile) ID() int {
 }
 
 func (df *DataFile) Size() int64 {
+	df.mu.RLock()
+	defer df.mu.RUnlock()
 	return df.writeOffset
 }
 

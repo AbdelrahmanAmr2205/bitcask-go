@@ -2,6 +2,7 @@ package bitcask_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,7 +27,7 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 		dir := setupTestDir(t)
 		defer os.RemoveAll(dir)
 
-		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0)
+		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("failed to initialize test database: %v", err)
 		}
@@ -73,7 +74,7 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 		defer os.RemoveAll(dir)
 
 		// Set a low max size threshold (30 bytes) to force rotation boundaries across sequential writes
-		db, err := bitcask.InitDB(dir, 30, 0, 0)
+		db, err := bitcask.InitDB(dir, 30, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("failed initializing database rotation bounds: %v", err)
 		}
@@ -116,7 +117,7 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 		defer os.RemoveAll(dir)
 
 		// 1. Initialize instance and fill with data updates
-		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0)
+		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("failed starting recovery source layer: %v", err)
 		}
@@ -128,7 +129,7 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 		db.Close() // Simulate application clean crash shutdown
 
 		// 2. Boot up a completely fresh engine instance targeting the same directory
-		recoveredDB, err := bitcask.InitDB(dir, 1024*1024, 0, 0)
+		recoveredDB, err := bitcask.InitDB(dir, 1024*1024, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("failed recovering storage directory bootstrap sequence: %v", err)
 		}
@@ -150,7 +151,7 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 		dir := setupTestDir(t)
 		defer os.RemoveAll(dir)
 
-		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0)
+		db, err := bitcask.InitDB(dir, 1024*1024, 0, 0, 0)
 		if err != nil {
 			t.Fatalf("failed starting concurrency test baseline: %v", err)
 		}
@@ -176,4 +177,117 @@ func TestBitcaskEngine_TableDriven(t *testing.T) {
 
 		wg.Wait() // Ensure zero data races or thread interlocks occur
 	})
+}
+
+func TestBitcaskEngine_BackgroundCompaction(t *testing.T) {
+	dir := setupTestDir(t)
+	defer os.RemoveAll(dir)
+
+	// Set compact interval low (100ms) with a tiny max file limit (25 bytes) to force rapid sweeps
+	db, err := bitcask.InitDB(dir, 25, 100*time.Millisecond, 0, 50)
+	if err != nil {
+		t.Fatalf("failed initializing compaction target instance: %v", err)
+	}
+
+	// 1. Write the exact same key multiple times.
+	// This generates numerous historical files containing stale data on disk.
+	for i := 0; i < 10; i++ {
+		err := db.Put("persistent_key", []byte(fmt.Sprintf("payload_update_index_%d", i)))
+		if err != nil {
+			t.Fatalf("failed writing log stream: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond) // Let files rotate naturally bounds-wise
+	}
+
+	// 2. Sleep to allow the background ticker to fire and clean the directory
+	time.Sleep(300 * time.Millisecond)
+
+	// 3. Confirm the latest value remains perfectly readable
+	got, err := db.Get("persistent_key")
+	if err != nil {
+		t.Fatalf("failed fetching key after compaction passes: %v", err)
+	}
+
+	if !bytes.Contains(got, []byte("payload_update_index_9")) {
+		t.Errorf("compaction state corruption: expected latest payload, got %s", string(got))
+	}
+	db.Close()
+
+	// 4. Verify disk space recovery: the dozens of initial files should be collapsed
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed inspecting post-merge layout: %v", err)
+	}
+
+	var dataFilesCount int
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".data" {
+			dataFilesCount++
+		}
+	}
+
+	// Out of the 10 rotated segments, compaction should have collapsed the historic layers,
+	// leaving a heavily minimized set of optimized file entries on disk.
+	if dataFilesCount > 4 {
+		t.Errorf("garbage collection failed to shrink data logs properly: found %d remaining data files", dataFilesCount)
+	}
+}
+
+func TestBitcaskEngine_HintFileBoot(t *testing.T) {
+	dir := setupTestDir(t)
+	defer os.RemoveAll(dir)
+
+	// Set compact interval low (100ms) with a tiny max file limit (25 bytes) to force rapid sweeps
+	db, err := bitcask.InitDB(dir, 25, 100*time.Millisecond, 0, 50)
+	if err != nil {
+		t.Fatalf("failed initializing compaction target instance: %v", err)
+	}
+
+	// Write key-values to trigger rotation and compaction
+	for i := 0; i < 10; i++ {
+		err := db.Put("hint_key", []byte(fmt.Sprintf("payload_%d", i)))
+		if err != nil {
+			t.Fatalf("failed writing log stream: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Wait for compaction to generate .hint files
+	time.Sleep(300 * time.Millisecond)
+	db.Close()
+
+	// Verify hint files exist
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed inspecting post-compaction layout: %v", err)
+	}
+
+	var hintFilesCount int
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".hint" {
+			hintFilesCount++
+		}
+	}
+
+	if hintFilesCount == 0 {
+		t.Fatalf("compaction failed to produce .hint files")
+	}
+
+	// Boot up a fresh engine instance to read from the generated hint files
+	recoveredDB, err := bitcask.InitDB(dir, 25, 100*time.Millisecond, 0, 50)
+	if err != nil {
+		t.Fatalf("failed recovering database from hint files: %v", err)
+	}
+	defer recoveredDB.Close()
+
+	// Confirm that the latest value is available and correct
+	got, err := recoveredDB.Get("hint_key")
+	if err != nil {
+		t.Fatalf("failed fetching key after hint boot: %v", err)
+	}
+
+	expected := []byte("payload_9")
+	if !bytes.Equal(got, expected) {
+		t.Errorf("hint recovery mismatch: got %s, want %s", string(got), expected)
+	}
 }
