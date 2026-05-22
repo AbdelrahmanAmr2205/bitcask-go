@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 const HeaderSize = 12
 
 type Header struct {
-	timepstamp uint32 // UNIX epoch timestamp
-	keySize    uint32
-	valSize    uint32
+	Timestamp uint32 // UNIX epoch timestamp
+	KeySize   uint32
+	ValSize   uint32
 }
 
 // Record represents the complete structural data layout exactly as it exists on disk.
@@ -24,9 +25,9 @@ type Record struct {
 func NewRecord(key string, val []byte, timestamp uint32) Record {
 	return Record{
 		Header: Header{
-			timepstamp: timestamp,
-			keySize:    uint32(len(key)),
-			valSize:    uint32(len(val)),
+			Timestamp: timestamp,
+			KeySize:   uint32(len(key)),
+			ValSize:   uint32(len(val)),
 		},
 		Key: key,
 		Val: val,
@@ -34,7 +35,7 @@ func NewRecord(key string, val []byte, timestamp uint32) Record {
 }
 
 func (r *Record) Size() uint64 {
-	return uint64(HeaderSize + r.Header.keySize + r.Header.valSize)
+	return uint64(HeaderSize + r.Header.KeySize + r.Header.ValSize)
 }
 
 func (r *Record) Encode() ([]byte, error) {
@@ -48,4 +49,12 @@ func (r *Record) Encode() ([]byte, error) {
 	buf.Write(r.Val)
 
 	return buf.Bytes(), nil
+}
+
+func DecodeHeader(r io.Reader) (Header, error) {
+	var h Header
+	if err := binary.Read(r, binary.LittleEndian, &h); err != nil {
+		return Header{}, err
+	}
+	return h, nil
 }

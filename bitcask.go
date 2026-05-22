@@ -3,9 +3,7 @@ package bitcask
 import (
 	"context"
 	"errors"
-	"os"
-	"strconv"
-	"strings"
+	"fmt"
 	"sync"
 	"time"
 
@@ -56,6 +54,7 @@ func (db *DB) startWriteLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			//TODO: add draining logic before terminating
+			db.cancelFunc()
 			return
 		case req := <-db.writeChan:
 			record := datafile.NewRecord(req.key, req.value, req.timestamp)
@@ -79,8 +78,28 @@ func (db *DB) startWriteLoop(ctx context.Context) {
 			})
 
 			req.respCh <- writeResponse{err: nil}
+
+			if db.activeFile.Size() >= db.config.MaxActiveFileSize {
+				db.createNewActiveFile(db.activeFile.ID() + 1)
+			}
 		}
 	}
+}
+
+func (db *DB) createNewActiveFile(fileID int) error {
+	var err error
+	for range 5 {
+		newFile, err := datafile.OpenDataFile(db.config.Directory, fileID)
+		if err == nil {
+			db.activeFile = newFile
+			db.muFiles.Lock()
+			db.files[fileID] = newFile
+			db.muFiles.Unlock()
+			return nil
+		}
+	}
+
+	return fmt.Errorf("couldn't create new active file: %w", err)
 }
 
 func (db *DB) Put(key string, val []byte) error {
@@ -99,9 +118,9 @@ func (db *DB) Put(key string, val []byte) error {
 }
 
 func (db *DB) Get(key string) ([]byte, error) {
-	entry, err := db.readKeyDirEntry(key)
-	if err != nil {
-		return nil, err
+	entry, exists := db.readKeyDirEntry(key)
+	if !exists {
+		return nil, errors.New("Key does not exist")
 	}
 
 	db.muFiles.RLock()
@@ -112,7 +131,7 @@ func (db *DB) Get(key string) ([]byte, error) {
 		return nil, errors.New("target database file segment missing")
 	}
 
-	val, err := targetFile.ReadRecord(entry.valOffset, entry.valsize)
+	val, err := targetFile.ReadValue(entry.valOffset, entry.valsize)
 	if err != nil {
 		return nil, err
 	}
@@ -127,89 +146,13 @@ func (db *DB) writeKeyDirEntry(key string, entry keyDirEntry) {
 	db.keyDir[key] = entry
 }
 
-func (db *DB) readKeyDirEntry(key string) (keyDirEntry, error) {
+func (db *DB) readKeyDirEntry(key string) (keyDirEntry, bool) {
 	db.muKeyDir.RLock()
 	defer db.muKeyDir.RUnlock()
 
 	entry, exists := db.keyDir[key]
-	if !exists {
-		return keyDirEntry{}, errors.New("Key does not exist")
-	}
 
-	return entry, nil
-}
-
-func InitDB(directoryPath string, maxActiveFileSize int64, compactInterval time.Duration, syncPeriod time.Duration) (*DB, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	config := Config{
-		Directory:         directoryPath,
-		MaxActiveFileSize: maxActiveFileSize,
-		SyncPeriod:        syncPeriod,
-		CompactInterval:   compactInterval,
-	}
-
-	db := &DB{
-		keyDir:     make(map[string]keyDirEntry),
-		writeChan:  make(chan writeRequest, 100),
-		files:      make(map[int]*datafile.DataFile),
-		config:     config,
-		cancelFunc: cancel,
-	}
-
-	err := db.loadFiles()
-	if err != nil {
-		return nil, err
-	}
-
-	go db.startWriteLoop(ctx)
-
-	return db, nil
-}
-
-func (db *DB) loadFiles() error {
-	dirEntries, err := os.ReadDir(db.config.Directory)
-	if err != nil {
-		return err
-	}
-
-	if len(dirEntries) == 0 {
-		activeFile, err := datafile.OpenDataFile(db.config.Directory, 1)
-		if err != nil {
-			return err
-		}
-		db.muFiles.Lock()
-		db.files[1] = activeFile
-		db.activeFile = activeFile
-		db.muFiles.Unlock()
-		return nil
-	}
-
-	maxFileID := 0
-	for _, dirEntry := range dirEntries {
-		fileID, err := strconv.Atoi(strings.TrimSuffix(dirEntry.Name(), ".data"))
-		if err != nil {
-			return err
-		}
-
-		if fileID > maxFileID {
-			maxFileID = fileID
-		}
-
-		db.muFiles.Lock()
-		db.files[fileID], err = datafile.OpenDataFile(db.config.Directory, fileID)
-		db.muFiles.Unlock()
-
-		if err != nil {
-			return err
-		}
-	}
-
-	db.muFiles.RLock()
-	db.activeFile = db.files[maxFileID]
-	db.muFiles.RUnlock()
-
-	return nil
+	return entry, exists
 }
 
 // Close ensures background processes wind down gracefully
