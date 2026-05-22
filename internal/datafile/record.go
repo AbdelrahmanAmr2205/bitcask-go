@@ -38,7 +38,7 @@ func (r *Record) Size() uint64 {
 }
 
 func (r *Record) Encode() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, r.Size()))
+	buf := bytes.NewBuffer(make([]byte, 0, r.Size()))
 
 	if err := binary.Write(buf, binary.LittleEndian, &r.Header); err != nil {
 		return nil, fmt.Errorf("failed to encode record header: %w", err)

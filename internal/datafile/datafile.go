@@ -3,6 +3,7 @@ package datafile
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -15,7 +16,8 @@ type DataFile struct {
 }
 
 func OpenDataFile(path string, fileID int) (*DataFile, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	fileName := fmt.Sprintf("%010d.txt", fileID)
+	file, err := os.OpenFile(filepath.Join(path, fileName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
@@ -66,4 +68,8 @@ func (df *DataFile) Close() error {
 	df.mu.Lock()
 	defer df.mu.Unlock()
 	return df.file.Close()
+}
+
+func (df *DataFile) ID() int {
+	return df.id
 }
