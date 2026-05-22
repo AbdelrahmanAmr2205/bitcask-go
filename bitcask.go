@@ -140,6 +140,8 @@ func (db *DB) readKeyDirEntry(key string) (keyDirEntry, error) {
 }
 
 func InitDB(directoryPath string, maxActiveFileSize int64, compactInterval time.Duration, syncPeriod time.Duration) (*DB, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	config := Config{
 		Directory:         directoryPath,
 		MaxActiveFileSize: maxActiveFileSize,
@@ -148,10 +150,11 @@ func InitDB(directoryPath string, maxActiveFileSize int64, compactInterval time.
 	}
 
 	db := &DB{
-		keyDir:    make(map[string]keyDirEntry),
-		writeChan: make(chan writeRequest, 100),
-		files:     make(map[int]*datafile.DataFile),
-		config:    config,
+		keyDir:     make(map[string]keyDirEntry),
+		writeChan:  make(chan writeRequest, 100),
+		files:      make(map[int]*datafile.DataFile),
+		config:     config,
+		cancelFunc: cancel,
 	}
 
 	err := db.loadFiles()
@@ -159,7 +162,7 @@ func InitDB(directoryPath string, maxActiveFileSize int64, compactInterval time.
 		return nil, err
 	}
 
-	go db.startWriteLoop(context.TODO())
+	go db.startWriteLoop(ctx)
 
 	return db, nil
 }
@@ -168,6 +171,18 @@ func (db *DB) loadFiles() error {
 	dirEntries, err := os.ReadDir(db.config.Directory)
 	if err != nil {
 		return err
+	}
+
+	if len(dirEntries) == 0 {
+		activeFile, err := datafile.OpenDataFile(db.config.Directory, 1)
+		if err != nil {
+			return err
+		}
+		db.muFiles.Lock()
+		db.files[1] = activeFile
+		db.activeFile = activeFile
+		db.muFiles.Unlock()
+		return nil
 	}
 
 	maxFileID := 0
@@ -194,5 +209,20 @@ func (db *DB) loadFiles() error {
 	db.activeFile = db.files[maxFileID]
 	db.muFiles.RUnlock()
 
+	return nil
+}
+
+// Close ensures background processes wind down gracefully
+func (db *DB) Close() error {
+	db.cancelFunc()
+
+	db.muFiles.Lock()
+	defer db.muFiles.Unlock()
+
+	for _, f := range db.files {
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
